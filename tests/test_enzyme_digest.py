@@ -24,8 +24,38 @@ from enzyme_digest import (
     normalise_cuts,
     digest_linear,
     digest_circular,
-    ENZYME_DB
+    strip_gaps,
+    sequence_alphabet,
+    ENZYME_DB,
+    AMBIGUITY_DEFINITE,
+    AMBIGUITY_POSSIBLE,
 )
+import subprocess
+import sys
+
+SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      'enzyme_digest.py')
+
+
+def write_fasta(content):
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', delete=False) as f:
+        f.write(content)
+        return f.name
+
+
+def run_cli_with_status(content, *args):
+    """Run the CLI over a temporary FASTA; returns (combined output, exit code)."""
+    fname = write_fasta(content)
+    try:
+        proc = subprocess.run([sys.executable, SCRIPT, '-f', fname] + list(args),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        return proc.stdout.decode(), proc.returncode
+    finally:
+        os.unlink(fname)
+
+
+def run_cli(content, *args):
+    return run_cli_with_status(content, *args)[0]
 
 
 class TestParseFasta:
@@ -527,3 +557,189 @@ class TestEnzymeType:
         assert Enzyme("a", "GAATTC", 1, 5).describe_ends() == "5' overhang, 4 nt"
         assert Enzyme("b", "CCCGGG", 3, 3).describe_ends() == "blunt"
         assert Enzyme("c", "GAGCTC", 5, 1).describe_ends() == "3' overhang, 4 nt"
+
+
+class TestSequenceAmbiguity:
+    """Ambiguity codes in the *target sequence* (the site side was already
+    handled). 'definite' answers "where is this certain to cut?"; 'possible'
+    answers "could this cut at all?" - the question behind checking that an
+    enzyme leaves a sequence intact."""
+
+    SSPI = ENZYME_DB["SspI"]
+
+    def _cuts(self, seq, enzyme, mode, circular=False):
+        return sorted({h.cut for h in find_sites(seq, enzyme, mode, circular)})
+
+    def test_ambiguous_target_is_not_a_definite_cut(self):
+        # SspI AAT^ATT vs GGAAYATYATR: the Ys could be C, so no guarantee.
+        assert self._cuts("GGAAYATYATR", self.SSPI, AMBIGUITY_DEFINITE) == []
+
+    def test_ambiguous_target_is_a_possible_cut(self):
+        assert self._cuts("GGAAYATYATR", self.SSPI, AMBIGUITY_POSSIBLE) == [5]
+
+    def test_n_in_target_is_possible_but_not_definite(self):
+        eco = ENZYME_DB["EcoRI"]
+        assert self._cuts("NAATTC", eco, AMBIGUITY_DEFINITE) == []
+        assert self._cuts("NAATTC", eco, AMBIGUITY_POSSIBLE) == [1]
+
+    def test_disjoint_codes_never_match(self):
+        # Enzyme A against target Y (C or T) shares no base, in either mode.
+        for mode in (AMBIGUITY_DEFINITE, AMBIGUITY_POSSIBLE):
+            assert re.fullmatch(site_to_regex('A', mode), 'Y') is None
+
+    def test_overlapping_codes_match_only_in_possible_mode(self):
+        # Enzyme A against target R (A or G) may resolve to the A.
+        assert re.fullmatch(site_to_regex('A', AMBIGUITY_DEFINITE), 'R') is None
+        assert re.fullmatch(site_to_regex('A', AMBIGUITY_POSSIBLE), 'R')
+
+    def test_possible_is_always_a_superset_of_definite(self):
+        rng = random.Random(17)
+        names = list(ENZYME_DB)
+        for _ in range(400):
+            seq = ''.join(rng.choice("ACGTRYKMSWBDHVN") for _ in range(rng.randint(8, 40)))
+            enzyme = ENZYME_DB[rng.choice(names)]
+            circ = rng.choice([True, False])
+            definite = set(self._cuts(seq, enzyme, AMBIGUITY_DEFINITE, circ))
+            possible = set(self._cuts(seq, enzyme, AMBIGUITY_POSSIBLE, circ))
+            assert definite <= possible, (seq, enzyme.name)
+
+    def test_unknown_mode_raises(self):
+        with pytest.raises(ValueError, match="Unknown ambiguity mode"):
+            site_to_regex("GAATTC", "maybe")
+
+
+class TestCircularOriginSpanning:
+    def test_site_spanning_the_origin_is_found(self):
+        # GAATTC straddles the join: "TTC" at the end + "GAA" at the start.
+        seq = "TTCGGGGGGGGGGGAA"
+        eco = ENZYME_DB["EcoRI"]
+        assert [h.cut for h in find_sites(seq, eco)] == []
+        cuts, _ = normalise_cuts(
+            [h.cut for h in find_sites(seq, eco, AMBIGUITY_DEFINITE, True)], len(seq), True)
+        assert cuts == [14]
+
+    def test_no_spurious_sites_when_nothing_spans_the_origin(self):
+        seq = "AAGAATTCTTTTTTTTTT"
+        eco = ENZYME_DB["EcoRI"]
+        linear = [h.cut for h in find_sites(seq, eco)]
+        circular = [h.cut for h in find_sites(seq, eco, AMBIGUITY_DEFINITE, True)]
+        assert linear == circular
+
+    def test_tandem_sites_each_counted_once(self):
+        seq = "GAATTC" * 3
+        cuts, _ = normalise_cuts(
+            [h.cut for h in find_sites(seq, ENZYME_DB["EcoRI"], AMBIGUITY_DEFINITE, True)],
+            len(seq), True)
+        assert cuts == [1, 7, 13]
+
+    def test_site_longer_than_sequence(self):
+        assert find_sites("AAG", ENZYME_DB["EcoRI"], AMBIGUITY_DEFINITE, True) == []
+
+
+class TestSequenceAlphabet:
+    def test_strict_alphabet_rejects_ambiguity_codes(self):
+        fname = write_fasta(">s\nACGTY\n")
+        try:
+            with pytest.raises(SystemExit):
+                parse_fasta(fname, allow_ambiguity=False)
+        finally:
+            os.unlink(fname)
+
+    def test_permissive_alphabet_accepts_iupac_and_gaps(self):
+        fname = write_fasta(">s\nACGTRYKMSWBDHVN-\n")
+        try:
+            assert parse_fasta(fname, allow_ambiguity=True)[0][1] == "ACGTRYKMSWBDHVN-"
+        finally:
+            os.unlink(fname)
+
+    def test_permissive_alphabet_still_rejects_junk(self):
+        fname = write_fasta(">s\nACGTU\n")
+        try:
+            with pytest.raises(SystemExit):
+                parse_fasta(fname, allow_ambiguity=True)
+        finally:
+            os.unlink(fname)
+
+    def test_alphabet_contents(self):
+        assert sequence_alphabet(False) == frozenset("ACGT")
+        assert sequence_alphabet(True) == frozenset("ACGTRYKMSWBDHVN-")
+
+
+class TestStripGaps:
+    def test_removes_gaps_and_counts_them(self):
+        assert strip_gaps("AAT-ATT") == ("AATATT", 1)
+
+    def test_no_gaps_is_a_passthrough(self):
+        assert strip_gaps("AATATT") == ("AATATT", 0)
+
+    def test_gapped_site_is_a_real_site(self):
+        # A gap is an alignment artefact; the molecule reads straight through.
+        seq, removed = strip_gaps("GG-AAT--ATTGG")
+        assert removed == 3
+        assert [h.cut for h in find_sites(seq, ENZYME_DB["SspI"])] == [5]
+
+
+class TestRejectionMessages:
+    """Rejecting bad input only helps if the message says what is wrong and what
+    to do about it, so assert on content, not just exit status."""
+
+    def test_ambiguity_without_flag_is_rejected_loudly(self):
+        out, code = run_cli_with_status(">plasmid_v2\nGGAAYATYATRNN\n", '-e', 'SspI')
+        assert code != 0
+        for char in ("'N'", "'R'", "'Y'"):
+            assert char in out
+        assert "plasmid_v2" in out and "line 2" in out
+        assert "--ambiguity definite" in out and "--ambiguity possible" in out
+
+    def test_junk_with_flag_is_rejected_and_alphabet_listed(self):
+        out, code = run_cli_with_status(">bad\nACGTUZ\n", '-e', 'SspI', '-a', 'possible')
+        assert code != 0
+        assert "'U'" in out and "'Z'" in out and "ACGTRYKMSWBDHVN" in out
+        assert "rerun with" not in out
+
+    def test_mixed_junk_and_codes_are_distinguished(self):
+        out, code = run_cli_with_status(">mixed\nACGTYU\n", '-e', 'SspI')
+        assert "'U' is not valid DNA under any setting" in out
+        assert "'Y' is an IUPAC ambiguity/gap code" in out
+
+    def test_offending_character_is_never_truncated_away(self):
+        out, code = run_cli_with_status(">long\n" + "A" * 200 + "Y\n", '-e', 'SspI')
+        assert code != 0 and "'Y'" in out
+
+    def test_valid_input_still_succeeds(self):
+        out, code = run_cli_with_status(">ok\nAAGAATTCTT\n", '-e', 'EcoRI')
+        assert code == 0 and "REJECTED" not in out
+
+
+class TestAmbiguityCLI:
+    def test_definite_mode_hints_at_hidden_sites(self):
+        out = run_cli(">s\nGGAAYATYATR\n", '-e', 'SspI', '-a', 'definite')
+        assert "no cut sites found" in out
+        assert "1 further site(s) could cut" in out
+
+    def test_possible_mode_marks_speculative_cuts(self):
+        out = run_cli(">s\nGGAAYATYATR\n", '-e', 'SspI', '-a', 'possible')
+        assert "cut sites at: [5?]" in out
+        assert "maximal-cut scenario" in out
+
+    def test_linear_run_flags_that_it_did_not_wrap(self):
+        out = run_cli(">s\nGGAAYATYATR\n", '-e', 'BamHI', '-a', 'possible')
+        assert "no cut possible under any resolution" in out
+        assert "pass --circular" in out
+
+    def test_circular_run_makes_the_claim_unqualified(self):
+        out = run_cli(">s\nGGAAYATYATR\n", '-e', 'BamHI', '-a', 'possible', '-c')
+        assert "no cut possible under any resolution" in out
+        assert "pass --circular" not in out
+
+    def test_gaps_reported_and_stripped(self):
+        out = run_cli(">aln\nGG-AAT--ATTGG\n", '-e', 'SspI', '-a', 'definite')
+        assert "10 bp, linear (3 gap character(s) removed)" in out
+        assert "cut sites at: [5]" in out
+
+    def test_state_does_not_leak_between_records(self):
+        out = run_cli(">amb\nGGAAYATYATR\n>clean\nAAGAATTCTTGGATCCAA\n",
+                      '-e', 'SspI,EcoRI', '-a', 'possible')
+        _, clean = out.split("=== Digest of clean ===")
+        assert "?" not in clean
+        assert "maximal-cut scenario" not in clean

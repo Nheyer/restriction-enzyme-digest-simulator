@@ -5,7 +5,7 @@ import argparse
 import sys
 import math
 import re
-from typing import Dict, List, NamedTuple, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from enzyme_data import (
     COMPLEMENT,
@@ -17,6 +17,23 @@ from enzyme_data import (
 
 # Single source of truth for the version; pyproject.toml reads this attribute.
 __version__ = "0.1.0"
+
+# How to treat IUPAC ambiguity codes in the *target sequence*.
+#   DEFINITE: the site is cut however the ambiguous bases resolve - the bases
+#             the sequence allows are a subset of those the enzyme accepts.
+#             Answers "where will this definitely cut?".
+#   POSSIBLE: the site is cut for at least one resolution - the two base sets
+#             overlap. Answers "could this cut at all?", the question behind
+#             checking that an enzyme leaves a sequence intact.
+# Every definite site is also a possible site, never the other way round.
+AMBIGUITY_DEFINITE = 'definite'
+AMBIGUITY_POSSIBLE = 'possible'
+
+# Input alphabet policy. Only A/C/G/T is accepted unless --ambiguity is given,
+# so an ambiguous base is never silently treated as a non-match.
+CONCRETE_BASES = frozenset('ACGT')
+GAP_CHAR = '-'
+IUPAC_DISPLAY_ORDER = 'ACGTRYKMSWBDHVN'
 
 
 class Enzyme(NamedTuple):
@@ -111,18 +128,35 @@ def expand_ambiguity(site: str, max_expansions: int = 65536) -> List[str]:
     return results
 
 
-def site_to_regex(site: str) -> str:
+def site_to_regex(site: str, ambiguity: str = AMBIGUITY_DEFINITE) -> str:
     """Regex matching a recognition site, honouring IUPAC codes on both sides.
 
-    A code in the site matches a base in the target only when that target base
-    is unambiguously one of the bases the site accepts, so enzyme N matches a
-    target N but enzyme A does not.
+    Under ``AMBIGUITY_DEFINITE`` a code in the site matches a base in the target
+    only when that target base is unambiguously one of the bases the site
+    accepts, so enzyme N matches a target N but enzyme A does not. That answers
+    "where will this definitely cut?".
+
+    Under ``AMBIGUITY_POSSIBLE`` it is enough that the two overlap. Enzyme T
+    matches a target Y, because that Y may resolve to the T the enzyme needs;
+    enzyme A still does not match target Y, since Y is C or T and shares no
+    base with A. That answers "could this cut at all?" - what you need before
+    trusting that an enzyme leaves a sequence uncut.
     """
+    if ambiguity not in (AMBIGUITY_DEFINITE, AMBIGUITY_POSSIBLE):
+        raise ValueError(
+            "Unknown ambiguity mode '{}'. Use '{}' or '{}'.".format(
+                ambiguity, AMBIGUITY_DEFINITE, AMBIGUITY_POSSIBLE))
     site = validate_site(site)
+    definite = ambiguity == AMBIGUITY_DEFINITE
     parts = []
     for code in site:
         allowed = set(IUPAC_BASES[code])
-        matching = [c for c in IUPAC_ALPHABET if set(IUPAC_BASES[c]) <= allowed]
+        if definite:
+            matching = [c for c in IUPAC_ALPHABET if set(IUPAC_BASES[c]) <= allowed]
+        else:
+            matching = [c for c in IUPAC_ALPHABET if set(IUPAC_BASES[c]) & allowed]
+        if not matching:                      # unreachable for valid IUPAC codes
+            return '(?!)'
         parts.append(matching[0] if len(matching) == 1 else '[' + ''.join(matching) + ']')
     return ''.join(parts)
 
@@ -278,15 +312,29 @@ class SiteHit(NamedTuple):
     cut: int
 
 
-def find_sites(sequence: str, enzyme: Enzyme) -> List[SiteHit]:
+def find_sites(sequence: str, enzyme: Enzyme,
+               ambiguity: str = AMBIGUITY_DEFINITE,
+               circular: bool = False) -> List[SiteHit]:
     """Find every recognition site for an enzyme, on both strands.
 
     A non-palindromic enzyme such as BsaI recognises its site on either strand,
     and a site on the bottom strand cuts the top strand on the other side of
     the site, so both orientations are searched. For a fully symmetric enzyme
     the two searches coincide, so each site is reported once.
+
+    ``ambiguity`` selects how IUPAC codes in the *sequence* are judged; see
+    AMBIGUITY_DEFINITE / AMBIGUITY_POSSIBLE. When ``circular`` is set, sites
+    that straddle the origin are found too.
     """
     length = len(enzyme.site)
+    seq_len = len(sequence)
+    # A circular molecule has no ends: extend the scan window by length-1 bases
+    # so a site reading through the join is contiguous. Start indices stay
+    # within 0..seq_len-1, so no site is counted twice.
+    scan = sequence
+    if circular and 1 < length <= seq_len:
+        scan = sequence + sequence[:length - 1]
+
     hits: Dict[Tuple[int, int], SiteHit] = {}
     orientations = [('+', enzyme.site)]
     if not enzyme.is_symmetric:
@@ -294,8 +342,8 @@ def find_sites(sequence: str, enzyme: Enzyme) -> List[SiteHit]:
 
     for strand, pattern in orientations:
         # Lookahead, so that overlapping sites are all reported.
-        regex = re.compile('(?=(' + site_to_regex(pattern) + '))')
-        for match in regex.finditer(sequence):
+        regex = re.compile('(?=(' + site_to_regex(pattern, ambiguity) + '))')
+        for match in regex.finditer(scan):
             start = match.start()
             if strand == '+':
                 cut = start + enzyme.cut_top
@@ -338,14 +386,73 @@ def find_cut_positions(sequence: str, recognition: str, offset: int) -> List[int
     return sorted({match.start() + offset for match in regex.finditer(sequence)})
 
 
-def parse_fasta(filepath: str) -> List[Tuple[str, str]]:
-    """Parse a FASTA file and return list of (header, sequence)."""
+def sequence_alphabet(allow_ambiguity: bool) -> frozenset:
+    """The set of characters accepted in an input sequence."""
+    if allow_ambiguity:
+        return frozenset(IUPAC_ALPHABET) | {GAP_CHAR}
+    return CONCRETE_BASES
+
+
+def _describe_alphabet(allow_ambiguity: bool) -> str:
+    if allow_ambiguity:
+        return "{} and '{}' (gap)".format(IUPAC_DISPLAY_ORDER, GAP_CHAR)
+    return ''.join(sorted(CONCRETE_BASES))
+
+
+def _bad_alphabet_message(bad: List[str], header: str, lineno: int,
+                          allow_ambiguity: bool) -> str:
+    """Spell out every offending character and how to proceed."""
+    listed = ', '.join(repr(c) for c in bad)
+    where = "sequence '{}', line {}".format(header, lineno)
+    if allow_ambiguity:
+        return ("REJECTED - invalid character(s) {} in {}. Allowed: {}."
+                .format(listed, where, _describe_alphabet(True)))
+
+    permissive = sequence_alphabet(True)
+    codes = [c for c in bad if c in permissive]
+    unknown = [c for c in bad if c not in permissive]
+    msg = "REJECTED - non-ACGT character(s) {} in {}.".format(listed, where)
+    if unknown:
+        msg += " {} {} not valid DNA under any setting.".format(
+            ', '.join(repr(c) for c in unknown), 'are' if len(unknown) > 1 else 'is')
+    if codes:
+        msg += (" {} {}, which this tool refuses to guess at: rerun with"
+                " --ambiguity definite to report only cuts that are certain, or"
+                " --ambiguity possible to report every cut that could happen."
+                " Without --ambiguity only A/C/G/T is accepted, so an ambiguous"
+                " base is never silently treated as a non-match.").format(
+            ', '.join(repr(c) for c in codes),
+            'are IUPAC ambiguity/gap codes' if len(codes) > 1
+            else 'is an IUPAC ambiguity/gap code')
+    return msg
+
+
+def strip_gaps(sequence: str) -> Tuple[str, int]:
+    """Drop alignment gaps, returning (sequence, count_removed).
+
+    A gap is not a base - the molecule reads straight through it - so 'AAT-ATT'
+    really is an SspI site. Removing them keeps cut positions and fragment
+    lengths in real (ungapped) coordinates.
+    """
+    if GAP_CHAR not in sequence:
+        return sequence, 0
+    stripped = sequence.replace(GAP_CHAR, '')
+    return stripped, len(sequence) - len(stripped)
+
+
+def parse_fasta(filepath: str, allow_ambiguity: bool = False) -> List[Tuple[str, str]]:
+    """Parse a FASTA file and return list of (header, sequence).
+
+    Accepts A/C/G/T only, unless ``allow_ambiguity`` also permits every IUPAC
+    ambiguity code and the '-' gap character.
+    """
+    allowed = sequence_alphabet(allow_ambiguity)
     sequences = []
     current_header = None
     current_seq_parts = []
     try:
         with open(filepath, 'r') as f:
-            for line in f:
+            for lineno, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
@@ -357,9 +464,12 @@ def parse_fasta(filepath: str) -> List[Tuple[str, str]]:
                 else:
                     if current_header is None:
                         raise ValueError("FASTA file missing header line")
-                    if not re.match('^[ACGTRYSWKMBDHVNacgtryswkmbdhvn]+$', line):
-                        raise ValueError(f"Invalid DNA characters in line: {line[:50]}...")
-                    current_seq_parts.append(line.upper())
+                    upper = line.upper()
+                    bad = sorted(set(upper) - allowed)
+                    if bad:
+                        raise ValueError(_bad_alphabet_message(
+                            bad, current_header, lineno, allow_ambiguity))
+                    current_seq_parts.append(upper)
         if current_header is not None:
             sequences.append((current_header, ''.join(current_seq_parts)))
         elif not sequences:
@@ -409,9 +519,12 @@ def digest_circular(seq_len: int, cut_positions: List[int], min_fragment: int) -
     return fragments
 
 
-def print_fragment_table(fragments: List[int], enzyme_names: List[str]):
+def print_fragment_table(fragments: List[int], enzyme_names: List[str],
+                         note: Optional[str] = None):
     """Print a simple table of fragments."""
     print("\n--- Fragment Summary ---")
+    if note:
+        print(note)
     fragments_sorted = sorted(fragments, reverse=True)
     total_len = sum(fragments_sorted)
     print(f"{'#':>3} {'Size (bp)':>9}")
@@ -504,6 +617,15 @@ def main():
                              '(NAME:SEQ:OFFSET, NAME:G^AATTC, NAME:GGTCTC(1/5))')
     parser.add_argument('--circular', '-c', action='store_true',
                         help='Treat DNA as circular (default: linear)')
+    parser.add_argument('--ambiguity', '-a',
+                        choices=[AMBIGUITY_DEFINITE, AMBIGUITY_POSSIBLE],
+                        default=None,
+                        help='Permit IUPAC ambiguity codes and "-" gaps in the input '
+                             'sequence, and say how to treat them: "definite" counts '
+                             'only sites cut however the ambiguous bases resolve; '
+                             '"possible" also counts sites that could be cut, for '
+                             'checking that an enzyme cannot cut at all. Without this '
+                             'flag only A/C/G/T is accepted')
     parser.add_argument('--min-fragment', '-m', type=int, default=1,
                         help='Minimum fragment length to report (default: 1)')
     parser.add_argument('--output', '-o', choices=['table', 'gel', 'both'], default='table',
@@ -534,8 +656,13 @@ def main():
     if not args.fasta or not args.enzymes:
         parser.error("the following arguments are required: --fasta/-f, --enzymes/-e")
 
+    # Passing --ambiguity at all is what opens the input alphabet beyond ACGT;
+    # its value then selects how ambiguous bases are judged.
+    allow_ambiguity = args.ambiguity is not None
+    ambiguity = args.ambiguity or AMBIGUITY_DEFINITE
+
     # Parse FASTA
-    sequences = parse_fasta(args.fasta)
+    sequences = parse_fasta(args.fasta, allow_ambiguity=allow_ambiguity)
 
     # Parse enzymes
     enzyme_specs = [e.strip() for e in args.enzymes.split(',') if e.strip()]
@@ -555,22 +682,59 @@ def main():
             sys.exit(1)
 
     # Process each sequence
-    for header, seq in sequences:
+    for header, raw_seq in sequences:
+        seq, gaps_removed = strip_gaps(raw_seq)
         print(f"\n=== Digest of {header} ===")
-        print(f"Sequence length: {len(seq)} bp, {'circular' if args.circular else 'linear'}")
+        gap_note = f" ({gaps_removed} gap character(s) removed)" if gaps_removed else ""
+        print(f"Sequence length: {len(seq)} bp, "
+              f"{'circular' if args.circular else 'linear'}{gap_note}")
         print(f"Enzymes: {', '.join(enzyme_names)}")
 
+        # Only worth a second scan when the sequence actually carries codes.
+        seq_is_ambiguous = bool(set(seq) - CONCRETE_BASES)
+
         all_cuts = []
+        uncertain_cuts = []
         for enzyme in enzymes:
-            hits = find_sites(seq, enzyme)
-            cuts, dropped = normalise_cuts([h.cut for h in hits], len(seq), args.circular)
-            label = f"{enzyme.name} ({enzyme.notation})"
-            if cuts:
-                print(f"  {label} cut sites at: {cuts}")
-            elif hits:
-                print(f"  {label}: {len(hits)} recognition site(s) found, none cut")
+            def_hits = find_sites(seq, enzyme, AMBIGUITY_DEFINITE, args.circular)
+            def_cuts, dropped = normalise_cuts([h.cut for h in def_hits], len(seq), args.circular)
+            if seq_is_ambiguous:
+                pos_hits = find_sites(seq, enzyme, AMBIGUITY_POSSIBLE, args.circular)
+                pos_cuts, pos_dropped = normalise_cuts(
+                    [h.cut for h in pos_hits], len(seq), args.circular)
             else:
-                print(f"  {label}: no cut sites found")
+                pos_hits, pos_cuts, pos_dropped = def_hits, def_cuts, dropped
+            possible_only = [c for c in pos_cuts if c not in set(def_cuts)]
+
+            label = f"{enzyme.name} ({enzyme.notation})"
+            if ambiguity == AMBIGUITY_POSSIBLE:
+                hits, cuts, dropped = pos_hits, pos_cuts, pos_dropped
+                speculative = set(possible_only)
+                if cuts:
+                    rendered = ", ".join(f"{c}?" if c in speculative else str(c) for c in cuts)
+                    print(f"  {label} cut sites at: [{rendered}]")
+                elif hits:
+                    print(f"  {label}: {len(hits)} recognition site(s) found, none cut")
+                else:
+                    # The origin wrap only runs under --circular, so a linear
+                    # scan cannot promise anything about a circular molecule.
+                    scope = ("" if args.circular else
+                             " (linear scan; pass --circular if this molecule is circular)")
+                    print(f"  {label}: no cut possible under any resolution "
+                          f"of ambiguous bases{scope}")
+                uncertain_cuts.extend(possible_only)
+            else:
+                hits, cuts = def_hits, def_cuts
+                if cuts:
+                    print(f"  {label} cut sites at: {cuts}")
+                elif hits:
+                    print(f"  {label}: {len(hits)} recognition site(s) found, none cut")
+                else:
+                    print(f"  {label}: no cut sites found")
+                if possible_only:
+                    print(f"      note: {len(possible_only)} further site(s) could cut "
+                          f"depending on how ambiguous bases resolve "
+                          f"- rerun with --ambiguity possible to include them")
             if hits and not enzyme.is_symmetric:
                 bottom = sum(1 for h in hits if h.strand == '-')
                 print(f"    {len(hits) - bottom} site(s) on the top strand, "
@@ -580,7 +744,14 @@ def main():
                       f"linear sequence - not cut")
             all_cuts.extend(cuts)
 
+        if uncertain_cuts:
+            print("  (? = possible only: cut depends on how ambiguous bases resolve)")
+
         all_cuts = sorted(set(all_cuts))
+        frag_note = None
+        if uncertain_cuts:
+            frag_note = ("(maximal-cut scenario: includes cuts that depend on ambiguous "
+                         "bases, so these sizes may not match any single real sequence)")
 
         if args.circular:
             fragments = digest_circular(len(seq), all_cuts, args.min_fragment)
@@ -588,8 +759,10 @@ def main():
             fragments = digest_linear(len(seq), all_cuts, args.min_fragment)
 
         if args.output in ('table', 'both'):
-            print_fragment_table(fragments, enzyme_names)
+            print_fragment_table(fragments, enzyme_names, note=frag_note)
         if args.output in ('gel', 'both'):
+            if frag_note:
+                print(frag_note)
             print("\n--- Simulated Gel Electrophoresis (100 bp ladder) ---")
             draw_ascii_gel(fragments, DNA_LADDER_100BP, height=args.gel_height)
 
