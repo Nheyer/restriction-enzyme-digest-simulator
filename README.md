@@ -26,6 +26,16 @@ cd restriction-enzyme-digest-simulator
 
 No external runtime dependencies. Install `pytest` for running tests.
 
+## Project layout
+
+| File | Contents |
+|------|----------|
+| `enzyme_digest.py` | The simulator: parsing, site finding, digestion, output, CLI |
+| `enzyme_data.py` | Static reference data only - IUPAC codes, the complement table, the enzyme table, the ladder |
+| `tests/` | pytest suite |
+
+`enzyme_data.py` imports nothing from the simulator, so the enzyme table can be regenerated or diffed on its own.
+
 ## Usage
 
 ```bash

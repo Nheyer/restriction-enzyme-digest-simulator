@@ -1,8 +1,11 @@
+import ast
+import pathlib
 import random
 
 import pytest
 import tempfile
 import os
+import enzyme_data
 from enzyme_digest import (
     Enzyme,
     parse_fasta,
@@ -190,6 +193,47 @@ class TestLegacySpecConversion:
     def test_cut_outside_site_refuses_to_downgrade(self):
         with pytest.raises(ValueError, match="outside its recognition site"):
             to_legacy_spec(ENZYME_DB["BsaI"])
+
+
+class TestDataModule:
+    """The lookup tables live in enzyme_data, apart from the logic."""
+
+    def test_table_and_db_agree(self):
+        assert set(enzyme_data.ENZYME_TABLE) == set(ENZYME_DB)
+        for name, (site, top, bottom) in enzyme_data.ENZYME_TABLE.items():
+            assert ENZYME_DB[name] == Enzyme(name, site, top, bottom)
+
+    def test_data_module_holds_no_logic(self):
+        # No functions or classes of its own, so the tables cannot drift back
+        # into logic.
+        defined_here = [
+            name for name, value in vars(enzyme_data).items()
+            if getattr(value, '__module__', None) == 'enzyme_data'
+        ]
+        assert defined_here == []
+
+    def test_data_module_does_not_import_the_logic(self):
+        # It has to stay importable on its own; enzyme_digest depends on it,
+        # never the other way round.
+        tree = ast.parse(pathlib.Path(enzyme_data.__file__).read_text(encoding='utf-8'))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add(node.module)
+        assert 'enzyme_digest' not in imported
+        assert imported == {'typing'}
+
+    def test_complement_table_is_self_inverse(self):
+        for code in enzyme_data.IUPAC_ALPHABET:
+            assert reverse_complement(reverse_complement(code)) == code
+            # Complementing a code complements the bases it stands for.
+            complemented = reverse_complement(code)
+            assert set(enzyme_data.IUPAC_BASES[complemented]) == {
+                {'A': 'T', 'C': 'G', 'G': 'C', 'T': 'A'}[base]
+                for base in enzyme_data.IUPAC_BASES[code]
+            }
 
 
 class TestEnzymeDatabase:
