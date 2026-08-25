@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "restriction-enzyme-digest-simulator"
+description = "Simulate restriction enzyme digests on DNA sequences, compute fragment sizes, and draw an ASCII gel."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "Collins Amatu Gorgerat" }]
+keywords = ["bioinformatics", "dna", "restriction-enzyme", "digest", "molecular-biology"]
+dynamic = ["version"]
+dependencies = []
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+[project.urls]
+Homepage = "https://github.com/gorgerat/restriction-enzyme-digest-simulator"
+Issues = "https://github.com/gorgerat/restriction-enzyme-digest-simulator/issues"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+enzyme-digest = "enzyme_digest:main"
+
+[tool.setuptools]
+# Two flat modules rather than a package: `python enzyme_digest.py` keeps
+# working from a checkout, and the installed console script imports the same
+# files. enzyme_data holds the lookup tables, enzyme_digest the logic.
+py-modules = ["enzyme_digest", "enzyme_data"]
+
+[tool.setuptools.dynamic]
+version = { attr = "enzyme_digest.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

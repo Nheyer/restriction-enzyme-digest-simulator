@@ -17,20 +17,52 @@ A CLI tool to simulate restriction enzyme digests on DNA sequences, compute frag
 
 ## Installation
 
-Requires Python 3.8 or later.
+Requires Python 3.8 or later. No runtime dependencies.
+
+```bash
+pip install git+https://github.com/gorgerat/restriction-enzyme-digest-simulator.git
+```
+
+That puts an `enzyme-digest` command on your PATH:
+
+```bash
+enzyme-digest --fasta plasmid.fasta --enzymes EcoRI,BamHI
+```
+
+From a clone, for development:
 
 ```bash
 git clone https://github.com/gorgerat/restriction-enzyme-digest-simulator.git
 cd restriction-enzyme-digest-simulator
+pip install -e ".[test]"     # editable, with pytest
 ```
 
-No external runtime dependencies. Install `pytest` for running tests.
+Installing is optional - the script runs straight from a checkout with no
+install step and no dependencies:
+
+```bash
+python enzyme_digest.py --fasta plasmid.fasta --enzymes EcoRI,BamHI
+```
+
+The two invocations are equivalent; the examples below use `python enzyme_digest.py`.
+
+### As a library
+
+```python
+from enzyme_digest import ENZYME_DB, find_sites, digest_linear, normalise_cuts
+
+enzyme = ENZYME_DB["BsaI"]
+hits = find_sites(sequence, enzyme)
+cuts, uncut = normalise_cuts([h.cut for h in hits], len(sequence), circular=False)
+fragments = digest_linear(len(sequence), cuts, min_fragment=1)
+```
 
 ## Project layout
 
 | File | Contents |
 |------|----------|
 | `enzyme_digest.py` | The simulator: parsing, site finding, digestion, output, CLI |
+| `pyproject.toml` | Packaging metadata and the `enzyme-digest` entry point |
 | `enzyme_data.py` | Static reference data only - IUPAC codes, the complement table, the enzyme table, the ladder |
 | `tests/` | pytest suite |
 
@@ -54,6 +86,7 @@ python enzyme_digest.py --fasta <file.fasta> --enzymes <enzyme1,enzyme2,...> [op
 | `--gel-height` | Height of the ASCII gel | 30 |
 | `--list-enzymes` | List the built-in enzymes and exit | |
 | `--convert SPEC` | Show an enzyme in both notations and exit | |
+| `--version` | Print the version and exit | |
 
 ### Enzyme specifications
 
@@ -141,6 +174,13 @@ Cut positions are 0-based offsets from the start of the recognition site, measur
 - Methylation sensitivity, star activity, and enzymes requiring two sites are not modelled.
 
 ## Testing
+
+```bash
+pip install -e ".[test]"
+pytest tests/ -v
+```
+
+Or without installing anything:
 
 ```bash
 pip install pytest

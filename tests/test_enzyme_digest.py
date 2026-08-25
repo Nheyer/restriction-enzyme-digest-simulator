@@ -1,11 +1,14 @@
 import ast
+import importlib
 import pathlib
 import random
+import re
 
 import pytest
 import tempfile
 import os
 import enzyme_data
+import enzyme_digest
 from enzyme_digest import (
     Enzyme,
     parse_fasta,
@@ -193,6 +196,39 @@ class TestLegacySpecConversion:
     def test_cut_outside_site_refuses_to_downgrade(self):
         with pytest.raises(ValueError, match="outside its recognition site"):
             to_legacy_spec(ENZYME_DB["BsaI"])
+
+
+class TestPackaging:
+    """The project has to stay installable, and the metadata has to match."""
+
+    def test_version_is_a_release_number(self):
+        assert re.fullmatch(r'\d+\.\d+(\.\d+)?([ab]\d+|rc\d+|\.dev\d+)?', enzyme_digest.__version__)
+
+    def test_console_script_target_exists(self):
+        # pyproject declares enzyme-digest = "enzyme_digest:main".
+        assert callable(enzyme_digest.main)
+
+    def test_pyproject_ships_every_module_the_tool_needs(self):
+        """An installed copy has to carry enzyme_data too, not just the logic."""
+        tomllib = pytest.importorskip("tomllib")  # 3.11+; skipped on older
+        root = pathlib.Path(enzyme_digest.__file__).parent
+        pyproject = root / "pyproject.toml"
+        if not pyproject.exists():
+            pytest.skip("running against an installed copy, not a checkout")
+        config = tomllib.loads(pyproject.read_text(encoding='utf-8'))
+
+        declared = set(config['tool']['setuptools']['py-modules'])
+        not_shipped = {'setup', 'conftest'}  # tooling, not part of the package
+        on_disk = {path.stem for path in root.glob('*.py')} - not_shipped
+        assert on_disk <= declared, "module in the repo root missing from py-modules"
+
+        entry = config['project']['scripts']['enzyme-digest']
+        module, _, attribute = entry.partition(':')
+        assert module in declared
+        assert hasattr(importlib.import_module(module), attribute)
+
+        version_attr = config['tool']['setuptools']['dynamic']['version']['attr']
+        assert version_attr == 'enzyme_digest.__version__'
 
 
 class TestDataModule:

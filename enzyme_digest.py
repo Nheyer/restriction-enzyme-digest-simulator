@@ -15,6 +15,9 @@ from enzyme_data import (
     IUPAC_BASES,
 )
 
+# Single source of truth for the version; pyproject.toml reads this attribute.
+__version__ = "0.1.0"
+
 
 class Enzyme(NamedTuple):
     """A restriction enzyme.
@@ -511,6 +514,8 @@ def main():
                         help='List the built-in enzymes and exit')
     parser.add_argument('--convert', metavar='SPEC',
                         help='Show an enzyme in both notations and exit')
+    parser.add_argument('--version', action='version',
+                        version='%(prog)s {}'.format(__version__))
 
     args = parser.parse_args()
 

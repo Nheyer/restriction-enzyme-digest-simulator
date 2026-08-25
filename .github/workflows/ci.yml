@@ -4,17 +4,31 @@ on: [push, pull_request]
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest supported interpreter, on the newest runner that has it.
+          - { os: ubuntu-22.04, python-version: '3.8' }
+          - { os: ubuntu-latest, python-version: '3.9' }
+          - { os: ubuntu-latest, python-version: '3.12' }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - name: Install dependencies
+          python-version: ${{ matrix.python-version }}
+      - name: Install the package
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install ".[test]"
       - name: Syntax check
         run: python -m py_compile enzyme_digest.py enzyme_data.py
       - name: Run tests
-        run: PYTHONPATH=. pytest tests/ -v
+        run: pytest tests/ -v
+      - name: Smoke-test the installed console script
+        run: |
+          cd "$RUNNER_TEMP"          # away from the source, so this is the installed copy
+          enzyme-digest --version
+          enzyme-digest --list-enzymes
+          enzyme-digest --convert BsaI
