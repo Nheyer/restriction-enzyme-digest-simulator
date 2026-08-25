@@ -5,7 +5,11 @@ A CLI tool to simulate restriction enzyme digests on DNA sequences, compute frag
 ## Features
 - In silico digestion of linear or circular DNA from FASTA files.
 - Supports multiple enzymes simultaneously (combining their cuts).
-- Built-in library of 88 restriction enzymes, with specificities taken from [REBASE](http://rebase.neb.com).
+- Built-in library of 262 restriction enzymes, generated from `restriction_enzymes.csv`
+  (NEB's commercially available specificities). Point `--enzyme-db` at your own CSV to override it.
+- IUPAC ambiguity codes honoured in the sequence as well as the site, with a
+  `definite` / `possible` distinction for checking that an enzyme *cannot* cut.
+- Circular sequences: sites spanning the origin are found, not just wrapped cut positions.
 - Enzymes are defined in standard NEB/REBASE notation: `G^AATTC`, `GGTCTC(1/5)`.
 - IUPAC ambiguity codes in recognition sites (`GTYRAC`, `CCANNNNNNTGG`).
 - Non-palindromic enzymes: both strands are searched, and bottom-strand sites cut where the enzyme actually cuts them.
@@ -63,10 +67,56 @@ fragments = digest_linear(len(sequence), cuts, min_fragment=1)
 |------|----------|
 | `enzyme_digest.py` | The simulator: parsing, site finding, digestion, output, CLI |
 | `pyproject.toml` | Packaging metadata and the `enzyme-digest` entry point |
-| `enzyme_data.py` | Static reference data only - IUPAC codes, the complement table, the enzyme table, the ladder |
+| `enzyme_data.py` | Static reference data only - IUPAC codes, the complement table, the enzyme tables, the ladder |
+| `restriction_enzymes.csv` | Source of truth for the enzyme tables: `enzyme,recognition_sequence` in NEB notation |
+| `tools/build_enzyme_table.py` | Regenerates the tables in `enzyme_data.py` from that CSV |
 | `tests/` | pytest suite |
 
 `enzyme_data.py` imports nothing from the simulator, so the enzyme table can be regenerated or diffed on its own.
+
+### The enzyme database
+
+`restriction_enzymes.csv` is the source of truth. Each row is an enzyme and its
+recognition specificity in the notation NEB publishes, where `^` marks the
+top-strand cut and `_` the bottom-strand cut:
+
+```
+enzyme,recognition_sequence
+EcoRI,G^AATTC                    both strands cut inside the site
+AatII,G_ACGT^C                   3' overhang; the two cuts are not mirrored
+BsaI,GGTCTCN^NNNN_               type IIS, cutting downstream of the site
+MluCI,^AATT_                     cuts immediately before the site
+```
+
+Leading and trailing `N`s are spacing that positions a cut away from the site,
+so they are trimmed and the offsets kept - `BsaI` becomes `GGTCTC(1/5)`.
+Internal `N`s are part of what the enzyme recognises and are kept.
+
+Regenerate the tables after editing the CSV (CI fails if they drift apart):
+
+```bash
+python tools/build_enzyme_table.py          # rewrite enzyme_data.py
+python tools/build_enzyme_table.py --check  # just verify it is current
+```
+
+The table is generated into `enzyme_data.py` rather than read at import time
+for two reasons: `enzyme_data.py` is data-only by design, with no functions to
+parse a CSV, and setuptools ships `py-modules` but not data files beside them,
+so a CSV read at runtime would not survive `pip install`. To use a different
+CSV without regenerating, pass `--enzyme-db`:
+
+```bash
+enzyme-digest --enzyme-db my_enzymes.csv -f plasmid.fasta -e MyI
+```
+
+Of the 287 rows in the shipped CSV, 262 load as enzymes. The rest cannot be
+expressed as a single cut per strand and are named so that asking for one gives
+a useful error rather than "unknown enzyme":
+
+- **13 nicking enzymes** (`Nb.*`, `Nt.*`) cut one strand only. They leave the
+  duplex intact, so there is no fragment pattern to simulate.
+- **12 type IIB enzymes** (`BcgI`, `BaeI`, `CspCI`, ...) cut on *both* sides of
+  their site, excising it. Two cuts per site do not fit the single-cut model.
 
 ## Usage
 
@@ -84,7 +134,9 @@ python enzyme_digest.py --fasta <file.fasta> --enzymes <enzyme1,enzyme2,...> [op
 | `-m`, `--min-fragment` | Minimum fragment length to report (bp) | 1 |
 | `-o`, `--output` | Output mode: `table`, `gel`, or `both` | `table` |
 | `--gel-height` | Height of the ASCII gel | 30 |
-| `--list-enzymes` | List the built-in enzymes and exit | |
+| `-a`, `--ambiguity` | Permit IUPAC codes/gaps and say how to treat them: `definite` or `possible` | off (`ACGT` only) |
+| `--enzyme-db CSV` | Read enzymes from a CSV instead of the built-in table | built-in |
+| `--list-enzymes` | List the available enzymes and exit | |
 | `--convert SPEC` | Show an enzyme in both notations and exit | |
 | `--version` | Print the version and exit | |
 
@@ -104,6 +156,52 @@ Custom enzymes can be written in any of these forms:
 A bare recognition string with no name also works (`-e "G^AATTC"`).
 
 Recognition sites may use the IUPAC ambiguity codes `RYSWKMBDHVN`. A code in the site matches a base in the target only when that base is unambiguously one the site accepts, so an `N` in the enzyme matches an `N` in the sequence, but an `A` does not.
+
+### Input alphabet
+
+By default **only `A`, `C`, `G` and `T` are accepted** in a sequence - anything
+else is a hard error naming every offending character, the record and the line.
+That is deliberate: an unrecognised base silently failing to match is exactly
+how a sequence gets wrongly cleared as "uncut".
+
+Passing `--ambiguity` (with either value) opts into the full alphabet
+`ACGTRYKMSWBDHVN` plus `-` for alignment gaps. Gaps are stripped before
+digestion and the count reported, since a gap is an alignment artefact rather
+than a base - `AAT-ATT` really is an SspI site - so cut positions and fragment
+lengths stay in ungapped coordinates.
+
+### Ambiguous bases
+
+A sequence carrying IUPAC codes makes "does this enzyme cut here?" two
+different questions, and `--ambiguity` picks which one you are asking:
+
+| Mode | Counts a site when | Answers |
+|------|--------------------|---------|
+| `definite` | the site is cut **however** the ambiguous bases resolve | "Where will this definitely cut?" |
+| `possible` | the site is cut under **at least one** resolution | "Could this cut at all?" |
+
+Every definite site is also a possible site. For SspI (`AAT^ATT`) against
+`GGAAYATYATR`, each `Y` could be C, so there is no guaranteed cut - but if both
+are T the site is real:
+
+```bash
+$ enzyme-digest -f seq.fasta -e SspI --ambiguity definite
+  SspI (AAT^ATT): no cut sites found
+      note: 1 further site(s) could cut depending on how ambiguous bases resolve
+            - rerun with --ambiguity possible to include them
+
+$ enzyme-digest -f seq.fasta -e SspI --ambiguity possible
+  SspI (AAT^ATT) cut sites at: [5?]
+  (? = possible only: cut depends on how ambiguous bases resolve)
+```
+
+Sites that hinge on an ambiguous base are marked `?`. Because `possible` mode
+digests the *maximal-cut* scenario, its fragment sizes may not correspond to
+any single real sequence, and the table and gel say so when that applies.
+
+**To check that an enzyme leaves a sequence intact**, use `possible` and look
+for `no cut possible under any resolution of ambiguous bases`. A clean result
+in `definite` mode does not rule out a cut.
 
 ### Converting between notations
 
@@ -169,9 +267,10 @@ Cut positions are 0-based offsets from the start of the recognition site, measur
 ## Known limitations
 
 - Enzymes that cut on both sides of their recognition site (BaeI, BcgI, CspCI, `(10/15)ACNNNNGTAYC(12/7)`) are rejected rather than partly parsed: two cuts per site do not fit the single-cut fragment model.
-- Recognition sites that span the origin of a circular sequence are not found; only cut positions wrap.
 - Fragment lengths are top-strand lengths, so overhangs are not reflected in the reported sizes.
 - Methylation sensitivity, star activity, and enzymes requiring two sites are not modelled.
+- Nicking enzymes and type IIB enzymes are listed but not simulated; see [The enzyme database](#the-enzyme-database).
+- Fragment sizes under `--ambiguity possible` are the maximal-cut scenario and may not correspond to any single real sequence.
 
 ## Testing
 

@@ -24,6 +24,8 @@ jobs:
           pip install ".[test]"
       - name: Syntax check
         run: python -m py_compile enzyme_digest.py enzyme_data.py
+      - name: Enzyme table is in sync with restriction_enzymes.csv
+        run: python tools/build_enzyme_table.py --check
       - name: Run tests
         run: pytest tests/ -v
       - name: Smoke-test the installed console script

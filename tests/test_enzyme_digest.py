@@ -26,6 +26,8 @@ from enzyme_digest import (
     digest_circular,
     strip_gaps,
     sequence_alphabet,
+    split_cut_markers,
+    load_enzyme_csv,
     ENZYME_DB,
     AMBIGUITY_DEFINITE,
     AMBIGUITY_POSSIBLE,
@@ -213,7 +215,14 @@ class TestNebNotation:
 class TestLegacySpecConversion:
     def test_symmetric_enzyme_round_trips(self):
         for enzyme in ENZYME_DB.values():
+            # NAME:SEQ:OFFSET can only carry a mirrored cut inside the site.
+            # to_legacy_spec refuses anything else, and a symmetric enzyme can
+            # still cut outside: TspRI is CASTG(2/-7), cutting on both sides.
             if not enzyme.is_symmetric:
+                continue
+            if not 0 <= enzyme.cut_top <= len(enzyme.site):
+                with pytest.raises(ValueError, match="outside its recognition site"):
+                    to_legacy_spec(enzyme)
                 continue
             assert parse_enzyme_spec(to_legacy_spec(enzyme)) == enzyme, enzyme.name
 
@@ -743,3 +752,148 @@ class TestAmbiguityCLI:
         _, clean = out.split("=== Digest of clean ===")
         assert "?" not in clean
         assert "maximal-cut scenario" not in clean
+
+
+CSV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        'restriction_enzymes.csv')
+have_csv = pytest.mark.skipif(not os.path.exists(CSV_PATH),
+                              reason="running against an installed copy, not a checkout")
+
+
+class TestCutMarkers:
+    """NEB writes the top-strand cut as ^ and the bottom-strand cut as _."""
+
+    @pytest.mark.parametrize("spec, expected", [
+        # The primitive reports the markers present; mirroring a lone caret is
+        # the loader's job, since a lone marker also means "nicking" for Nb./Nt.
+        ("G^AATTC",       ("GAATTC", [1], [])),     # EcoRI, caret shorthand
+        ("G_ACGT^C",      ("GACGTC", [5], [1])),    # AatII: 3' overhang
+        ("AGC^_GCT",      ("AGCGCT", [3], [3])),    # AfeI: blunt
+        ("^AATT_",        ("AATT",   [0], [4])),    # MluCI: cuts before the site
+        ("GGTCTCN^NNNN_", ("GGTCTC", [7], [11])),   # BsaI: type IIS, N padding trimmed
+        ("GACNN_N^NNGTC", ("GACNNNNNGTC", [6], [5])),  # AhdI: internal Ns kept
+    ])
+    def test_split(self, spec, expected):
+        assert split_cut_markers(spec) == expected
+
+    def test_internal_ns_are_not_trimmed(self):
+        # Only leading/trailing Ns are spacing; XmnI recognises across its Ns.
+        site, top, bottom = split_cut_markers("GAANN^_NNTTC")
+        assert site == "GAANNNNTTC" and top == [5] and bottom == [5]
+
+    def test_dual_cut_reports_both_markers(self):
+        _, top, bottom = split_cut_markers("_NN^NNNNNNNNNNGCANNNNNNTGCNNNNNNNNNN_NN^")
+        assert len(top) == 2 and len(bottom) == 2
+
+    def test_type_iis_offsets_land_outside_the_site(self):
+        site, top, bottom = split_cut_markers("CTGAAGNNNNNNNNNNNNNN_NN^")
+        assert site == "CTGAAG"           # AcuI, CTGAAG(16/14)
+        assert (top, bottom) == ([22], [20])
+
+
+@have_csv
+class TestEnzymeCsv:
+    def test_generated_table_matches_the_csv(self):
+        """enzyme_data.py is generated; this is the guard against drift."""
+        tables = load_enzyme_csv(CSV_PATH)
+        assert set(tables.enzymes) == set(enzyme_data.ENZYME_TABLE)
+        for name, enzyme in tables.enzymes.items():
+            assert enzyme_data.ENZYME_TABLE[name] == (
+                enzyme.site, enzyme.cut_top, enzyme.cut_bottom), name
+        assert set(tables.nicking) == set(enzyme_data.NICKING_ENZYMES)
+        assert set(tables.dual_cut) == set(enzyme_data.DUAL_CUT_ENZYMES)
+
+    def test_csv_splits_into_the_three_kinds(self):
+        tables = load_enzyme_csv(CSV_PATH)
+        assert len(tables.enzymes) > 200
+        # Nicking enzymes are the Nb./Nt. prefixed ones.
+        assert all(n.startswith(('Nb.', 'Nt.')) for n in tables.nicking)
+        assert 'BcgI' in tables.dual_cut
+
+    def test_every_loaded_enzyme_round_trips_through_notation(self):
+        for enzyme in load_enzyme_csv(CSV_PATH).enzymes.values():
+            assert parse_neb_notation(enzyme.notation) == (
+                enzyme.site, enzyme.cut_top, enzyme.cut_bottom), enzyme.name
+
+    def test_missing_columns_are_rejected(self):
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
+            f.write("name,site\nEcoRI,G^AATTC\n")
+            path = f.name
+        try:
+            with pytest.raises(ValueError, match="missing column"):
+                load_enzyme_csv(path)
+        finally:
+            os.unlink(path)
+
+    def test_empty_csv_is_rejected(self):
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
+            f.write("enzyme,recognition_sequence\n")
+            path = f.name
+        try:
+            with pytest.raises(ValueError, match="No usable enzymes"):
+                load_enzyme_csv(path)
+        finally:
+            os.unlink(path)
+
+    def test_cli_accepts_an_alternative_database(self):
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
+            f.write("enzyme,recognition_sequence\nMyI,G^AATTC\n")
+            path = f.name
+        try:
+            fasta = write_fasta(">s\nAAGAATTCTT\n")
+            try:
+                proc = subprocess.run(
+                    [sys.executable, SCRIPT, '-f', fasta, '-e', 'MyI', '--enzyme-db', path],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                out = proc.stdout.decode()
+                assert "Loaded 1 enzymes" in out
+                assert "cut sites at: [3]" in out
+            finally:
+                os.unlink(fasta)
+        finally:
+            os.unlink(path)
+
+
+class TestUnsupportedEnzymes:
+    """Naming what cannot be simulated beats 'unknown enzyme'."""
+
+    def test_nicking_enzyme_explains_itself(self):
+        with pytest.raises(ValueError, match="nicks one strand"):
+            parse_enzyme_spec("Nt.BbvCI")
+
+    def test_dual_cut_enzyme_explains_itself(self):
+        with pytest.raises(ValueError, match="cuts on both sides"):
+            parse_enzyme_spec("BcgI")
+
+    def test_genuinely_unknown_still_says_unknown(self):
+        with pytest.raises(ValueError, match="Unknown enzyme"):
+            parse_enzyme_spec("NoSuchI")
+
+    def test_nicking_lookup_is_case_insensitive(self):
+        with pytest.raises(ValueError, match="nicks one strand"):
+            parse_enzyme_spec("nt.bbvci")
+
+
+class TestTypeIisEnzymes:
+    """Enzymes that cut away from what they recognise."""
+
+    def test_bsai_cuts_downstream_of_its_site(self):
+        bsa = ENZYME_DB["BsaI"]
+        assert bsa.site == "GGTCTC" and (bsa.cut_top, bsa.cut_bottom) == (7, 11)
+        assert bsa.notation == "GGTCTC(1/5)"
+
+    def test_site_near_the_end_is_recognised_but_not_cut(self):
+        # The cut falls off the end of a linear sequence, so it is reported
+        # rather than silently missing.
+        seq = "AAAA" + "GGTCTC"
+        hits = find_sites(seq, ENZYME_DB["BsaI"])
+        assert hits
+        cuts, dropped = normalise_cuts([h.cut for h in hits], len(seq), False)
+        assert cuts == [] and dropped >= 1
+
+    def test_circular_wraps_the_downstream_cut(self):
+        seq = "GGTCTC" + "A" * 20
+        cuts, dropped = normalise_cuts(
+            [h.cut for h in find_sites(seq, ENZYME_DB["BsaI"], AMBIGUITY_DEFINITE, True)],
+            len(seq), True)
+        assert dropped == 0 and cuts

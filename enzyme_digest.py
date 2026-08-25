@@ -2,17 +2,21 @@
 """Restriction Enzyme Digest Simulator."""
 
 import argparse
+import functools
 import sys
 import math
 import re
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
+import csv as _csv
 from enzyme_data import (
     COMPLEMENT,
     DNA_LADDER_100BP,
+    DUAL_CUT_ENZYMES,
     ENZYME_TABLE,
     IUPAC_ALPHABET,
     IUPAC_BASES,
+    NICKING_ENZYMES,
 )
 
 # Single source of truth for the version; pyproject.toml reads this attribute.
@@ -128,6 +132,7 @@ def expand_ambiguity(site: str, max_expansions: int = 65536) -> List[str]:
     return results
 
 
+@functools.lru_cache(maxsize=4096)
 def site_to_regex(site: str, ambiguity: str = AMBIGUITY_DEFINITE) -> str:
     """Regex matching a recognition site, honouring IUPAC codes on both sides.
 
@@ -202,6 +207,99 @@ def parse_neb_notation(text: str) -> Tuple[str, int, int]:
     )
 
 
+def split_cut_markers(text: str) -> Tuple[str, List[int], List[int]]:
+    """Split a ``^``/``_`` marked specificity into (site, top_cuts, bottom_cuts).
+
+    This is the notation NEB publishes for its commercially available enzymes:
+    ``^`` marks the top-strand cut, ``_`` the bottom-strand cut, and Ns pad the
+    gap for enzymes that cut away from what they recognise::
+
+        G^AATTC                     EcoRI, both cuts inside the site
+        G_ACGT^C                    AatII, a 3' overhang
+        GGTCTCN^NNNN_               BsaI, cutting downstream
+
+    Offsets are in site coordinates, so the markers take up no position of
+    their own. Leading and trailing Ns are spacing rather than recognition, so
+    they are trimmed and the offsets shifted to match - BsaI comes back as
+    ('GGTCTC', 7, 11), which renders as GGTCTC(1/5).
+    """
+    site: List[str] = []
+    top: List[int] = []
+    bottom: List[int] = []
+    for char in text.strip().upper():
+        if char == '^':
+            top.append(len(site))
+        elif char == '_':
+            bottom.append(len(site))
+        else:
+            site.append(char)
+    joined = ''.join(site)
+    trimmed = joined.strip('N')
+    if trimmed:
+        lead = len(joined) - len(joined.lstrip('N'))
+        top = [value - lead for value in top]
+        bottom = [value - lead for value in bottom]
+        joined = trimmed
+    return joined, top, bottom
+
+
+class EnzymeTables(NamedTuple):
+    """Enzymes from a source file, split by what this tool can simulate."""
+    enzymes: Dict[str, Enzyme]
+    nicking: Dict[str, str]
+    dual_cut: Dict[str, str]
+
+
+def load_enzyme_csv(path: str) -> EnzymeTables:
+    """Read an ``enzyme,recognition_sequence`` CSV of NEB specificities.
+
+    Nicking enzymes (one strand only) and type IIB enzymes (a cut on each side
+    of the site) are kept aside rather than loaded: neither fits the one-cut
+    fragment model, and naming them gives a better error than "unknown enzyme".
+    """
+    enzymes: Dict[str, Enzyme] = {}
+    nicking: Dict[str, str] = {}
+    dual_cut: Dict[str, str] = {}
+    with open(path, newline='', encoding='utf-8') as handle:
+        reader = _csv.DictReader(handle)
+        missing = {'enzyme', 'recognition_sequence'} - set(reader.fieldnames or ())
+        if missing:
+            raise ValueError(
+                "{} is missing column(s) {}; expected a header "
+                "'enzyme,recognition_sequence'.".format(path, ', '.join(sorted(missing))))
+        for lineno, row in enumerate(reader, 2):
+            name = (row.get('enzyme') or '').strip()
+            spec = (row.get('recognition_sequence') or '').strip()
+            if not name or not spec:
+                continue
+            site, top, bottom = split_cut_markers(spec)
+            if len(top) > 1 or len(bottom) > 1:
+                dual_cut[name] = spec                      # type IIB
+            elif not top and not bottom:
+                raise ValueError(
+                    "{}, line {}: no cut marker in '{}'; mark the top-strand cut "
+                    "with '^' and the bottom-strand cut with '_'.".format(path, lineno, spec))
+            elif (not top or not bottom) and name.startswith(('Nb.', 'Nt.')):
+                # REBASE names nicking enzymes Nb.* (bottom) and Nt.* (top), and
+                # writes them with the one marker for the strand they cut.
+                nicking[name] = spec
+            else:
+                # One marker is the usual NEB shorthand for a cut whose partner
+                # mirrors it: G^AATTC means GAATTC with cuts at 1 and 5.
+                if not bottom:
+                    bottom = [len(site) - top[0]]
+                elif not top:
+                    top = [len(site) - bottom[0]]
+                try:
+                    validate_site(site)
+                except ValueError as exc:
+                    raise ValueError("{}, line {}: {}".format(path, lineno, exc))
+                enzymes[name] = Enzyme(name, site, top[0], bottom[0])
+    if not enzymes:
+        raise ValueError("No usable enzymes found in {}".format(path))
+    return EnzymeTables(enzymes, nicking, dual_cut)
+
+
 def to_neb_notation(enzyme: Enzyme) -> str:
     """Render an enzyme as a NEB/REBASE recognition specificity string."""
     length = len(enzyme.site)
@@ -232,7 +330,7 @@ def to_legacy_spec(enzyme: Enzyme) -> str:
     return "{}:{}:{}".format(enzyme.name, enzyme.site, enzyme.cut_top)
 
 
-def parse_enzyme_spec(spec: str) -> Enzyme:
+def parse_enzyme_spec(spec: str, tables: Optional[EnzymeTables] = None) -> Enzyme:
     """Parse an enzyme specification into an :class:`Enzyme`.
 
     Accepted forms:
@@ -243,9 +341,21 @@ def parse_enzyme_spec(spec: str) -> Enzyme:
       * ``NAME:SEQ:TOP:BOTTOM`` - both cuts, as offsets from the site start
     """
     spec = spec.strip()
-    canonical = _ENZYME_LOOKUP.get(spec.upper())
+    database = tables.enzymes if tables else ENZYME_DB
+    lookup = ({name.upper(): name for name in database} if tables else _ENZYME_LOOKUP)
+    canonical = lookup.get(spec.upper())
     if canonical:
-        return ENZYME_DB[canonical]
+        return database[canonical]
+
+    nicking = tables.nicking if tables else NICKING_ENZYMES
+    dual_cut = tables.dual_cut if tables else DUAL_CUT_ENZYMES
+    for table, reason in ((nicking, "nicks one strand and leaves the duplex intact, so it "
+                                    "produces no fragments to simulate"),
+                          (dual_cut, "cuts on both sides of its recognition site; two cuts "
+                                     "per site do not fit the single-cut fragment model")):
+        match = {name.upper(): name for name in table}.get(spec.upper())
+        if match:
+            raise ValueError("{} ({}) {}.".format(match, table[match], reason))
 
     parts = spec.split(':')
     if len(parts) == 1:
@@ -299,6 +409,16 @@ def _is_int(value: str) -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=4096)
+def _site_pattern(site: str, ambiguity: str):
+    """Compiled matcher for a site. Lookahead, so overlapping sites all match.
+
+    Cached: a sweep digests many sequences with the same few hundred enzymes,
+    and rebuilding the character classes each time dominates the scan.
+    """
+    return re.compile('(?=(' + site_to_regex(site, ambiguity) + '))')
+
+
 class SiteHit(NamedTuple):
     """One recognition site found in a sequence.
 
@@ -341,8 +461,7 @@ def find_sites(sequence: str, enzyme: Enzyme,
         orientations.append(('-', reverse_complement(enzyme.site)))
 
     for strand, pattern in orientations:
-        # Lookahead, so that overlapping sites are all reported.
-        regex = re.compile('(?=(' + site_to_regex(pattern, ambiguity) + '))')
+        regex = _site_pattern(pattern, ambiguity)
         for match in regex.finditer(scan):
             start = match.start()
             if strand == '+':
@@ -573,17 +692,26 @@ def draw_ascii_gel(fragments: List[int], ladder_sizes: List[int], height: int = 
         print(line)
 
 
-def print_enzyme_list():
-    """Print the built-in enzymes with their recognition specificities."""
-    print(f"{'Enzyme':<9} {'Recognition site':<22} {'Ends':<18} Type")
-    print("-" * 64)
-    for name in sorted(ENZYME_DB, key=str.lower):
-        enzyme = ENZYME_DB[name]
+def print_enzyme_list(tables: Optional[EnzymeTables] = None):
+    """Print the available enzymes with their recognition specificities."""
+    database = tables.enzymes if tables else ENZYME_DB
+    nicking = tables.nicking if tables else NICKING_ENZYMES
+    dual_cut = tables.dual_cut if tables else DUAL_CUT_ENZYMES
+    print(f"{'Enzyme':<11} {'Recognition site':<24} {'Ends':<18} Type")
+    print("-" * 68)
+    for name in sorted(database, key=str.lower):
+        enzyme = database[name]
         kind = "palindromic" if enzyme.is_palindromic else "non-palindromic"
         if not 0 <= enzyme.cut_top <= len(enzyme.site):
             kind += ", cuts outside site"
-        print(f"{name:<9} {enzyme.notation:<22} {enzyme.describe_ends():<18} {kind}")
-    print(f"\n{len(ENZYME_DB)} enzymes. Specificities from REBASE (rebase.neb.com).")
+        print(f"{name:<11} {enzyme.notation:<24} {enzyme.describe_ends():<18} {kind}")
+    print(f"\n{len(database)} enzymes. Specificities from REBASE (rebase.neb.com).")
+    if nicking:
+        print(f"{len(nicking)} nicking enzyme(s) not listed - they cut one strand only "
+              f"and leave no fragments: {', '.join(sorted(nicking, key=str.lower))}")
+    if dual_cut:
+        print(f"{len(dual_cut)} type IIB enzyme(s) not listed - they cut on both sides of "
+              f"their site: {', '.join(sorted(dual_cut, key=str.lower))}")
 
 
 def print_conversion(spec: str):
@@ -617,6 +745,11 @@ def main():
                              '(NAME:SEQ:OFFSET, NAME:G^AATTC, NAME:GGTCTC(1/5))')
     parser.add_argument('--circular', '-c', action='store_true',
                         help='Treat DNA as circular (default: linear)')
+    parser.add_argument('--enzyme-db', metavar='CSV',
+                        help='Read enzymes from an "enzyme,recognition_sequence" CSV of '
+                             'NEB specificities instead of the built-in table. The '
+                             'built-in table is generated from restriction_enzymes.csv '
+                             'in the same format')
     parser.add_argument('--ambiguity', '-a',
                         choices=[AMBIGUITY_DEFINITE, AMBIGUITY_POSSIBLE],
                         default=None,
@@ -641,8 +774,19 @@ def main():
 
     args = parser.parse_args()
 
+    tables = None
+    if args.enzyme_db:
+        try:
+            tables = load_enzyme_csv(args.enzyme_db)
+        except (OSError, ValueError) as exc:
+            print(f"Error reading enzyme database: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Loaded {len(tables.enzymes)} enzymes from {args.enzyme_db}"
+              f" ({len(tables.nicking)} nicking, {len(tables.dual_cut)} dual-cut "
+              f"not simulated)", file=sys.stderr)
+
     if args.list_enzymes:
-        print_enzyme_list()
+        print_enzyme_list(tables)
         return
 
     if args.convert:
@@ -674,7 +818,7 @@ def main():
     enzyme_names = []
     for spec in enzyme_specs:
         try:
-            enzyme = parse_enzyme_spec(spec)
+            enzyme = parse_enzyme_spec(spec, tables)
             enzymes.append(enzyme)
             enzyme_names.append(enzyme.name)
         except ValueError as e:
