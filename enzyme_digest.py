@@ -530,7 +530,7 @@ def _bad_alphabet_message(bad: List[str], header: str, lineno: int,
     permissive = sequence_alphabet(True)
     codes = [c for c in bad if c in permissive]
     unknown = [c for c in bad if c not in permissive]
-    msg = "REJECTED - non-ACGT character(s) {} in {}.".format(listed, where)
+    msg = "non-ACGT character(s) {} in {}.".format(listed, where)
     if unknown:
         msg += " {} {} not valid DNA under any setting.".format(
             ', '.join(repr(c) for c in unknown), 'are' if len(unknown) > 1 else 'is')
@@ -638,8 +638,7 @@ def digest_circular(seq_len: int, cut_positions: List[int], min_fragment: int) -
     return fragments
 
 
-def print_fragment_table(fragments: List[int], enzyme_names: List[str],
-                         note: Optional[str] = None):
+def print_fragment_table(fragments: List[int], note: Optional[str] = None):
     """Print a simple table of fragments."""
     print("\n--- Fragment Summary ---")
     if note:
@@ -903,7 +902,7 @@ def main():
             fragments = digest_linear(len(seq), all_cuts, args.min_fragment)
 
         if args.output in ('table', 'both'):
-            print_fragment_table(fragments, enzyme_names, note=frag_note)
+            print_fragment_table(fragments, note=frag_note)
         if args.output in ('gel', 'both'):
             if frag_note:
                 print(frag_note)

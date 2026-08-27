@@ -31,7 +31,7 @@ decision and what a port would have to preserve.
 Requires Python 3.8 or later. No runtime dependencies.
 
 ```bash
-pip install git+https://github.com/gorgerat/restriction-enzyme-digest-simulator.git
+pip install git+https://github.com/Nheyer/restriction-enzyme-digest-simulator.git
 ```
 
 That puts an `enzyme-digest` command on your PATH:
@@ -43,7 +43,7 @@ enzyme-digest --fasta plasmid.fasta --enzymes EcoRI,BamHI
 From a clone, for development:
 
 ```bash
-git clone https://github.com/gorgerat/restriction-enzyme-digest-simulator.git
+git clone https://github.com/Nheyer/restriction-enzyme-digest-simulator.git
 cd restriction-enzyme-digest-simulator
 pip install -e ".[test]"     # editable, with pytest
 ```
