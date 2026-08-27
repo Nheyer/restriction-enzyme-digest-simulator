@@ -19,6 +19,13 @@ A CLI tool to simulate restriction enzyme digests on DNA sequences, compute frag
 - Handles overlapping recognition sites and no-cut scenarios.
 - Works on multi-sequence FASTA files, processing each entry separately.
 
+## Project status
+
+Upstream (`wl5e/restriction-enzyme-digest-simulator`) is archived and cannot take
+pull requests, so this fork continues the project. A C++ port is under
+consideration - see [ROADMAP.md](ROADMAP.md) for the measurements behind that
+decision and what a port would have to preserve.
+
 ## Installation
 
 Requires Python 3.8 or later. No runtime dependencies.
@@ -155,7 +162,7 @@ Custom enzymes can be written in any of these forms:
 
 A bare recognition string with no name also works (`-e "G^AATTC"`).
 
-Recognition sites may use the IUPAC ambiguity codes `RYSWKMBDHVN`. A code in the site matches a base in the target only when that base is unambiguously one the site accepts, so an `N` in the enzyme matches an `N` in the sequence, but an `A` does not.
+Recognition sites may use the IUPAC ambiguity codes `RYSWKMBDHVN`. How such a code is judged against the sequence depends on `--ambiguity` (see [Ambiguous bases](#ambiguous-bases)). Under the default `definite` reading a code matches a target base only when that base is unambiguously one the site accepts, so an `N` in the enzyme matches an `N` in the sequence, but an `A` does not.
 
 ### Input alphabet
 
@@ -291,4 +298,5 @@ PYTHONPATH=. pytest tests/ -v
 MIT License – see [LICENSE](LICENSE).
 
 ---
-*Author: Collins Amatu Gorgerat, 2026*
+*Original author: Collins Amatu Gorgerat, 2026. Continued in this fork by
+[@Nheyer](https://github.com/Nheyer) after the upstream project was archived.*

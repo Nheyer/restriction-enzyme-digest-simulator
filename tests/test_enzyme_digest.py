@@ -389,6 +389,81 @@ class TestAmbiguityCodes:
         assert find_cut_positions("GNNTC", "GANTC", 1) == []
 
 
+class TestDefiniteMatchingIsPinned:
+    """`--ambiguity definite` is the matching rule this tool has always used.
+
+    The table below is written out by hand rather than derived from
+    IUPAC_BASES, so that changing the rule fails here instead of being
+    mirrored by a re-derivation of itself. Read an entry as: a recognition
+    site carrying `code` matches exactly these bases in a target sequence.
+    A code matches only where the target cannot resolve to anything the
+    enzyme rejects - so the site is cut however the ambiguity resolves.
+    """
+
+    DEFINITE_MATCHES = {
+        'A': 'A',
+        'C': 'C',
+        'G': 'G',
+        'T': 'T',
+        'R': 'AGR',                # A or G
+        'Y': 'CTY',                # C or T
+        'S': 'CGS',                # C or G
+        'W': 'ATW',                # A or T
+        'K': 'GTK',                # G or T
+        'M': 'ACM',                # A or C
+        'B': 'CGTYSKB',            # not A
+        'D': 'AGTRWKD',            # not C
+        'H': 'ACTYWMH',            # not G
+        'V': 'ACGRSMV',            # not T
+        'N': 'ACGTRYSWKMBDHVN',    # anything
+    }
+
+    ALPHABET = 'ACGTRYSWKMBDHVN'
+
+    def _matches(self, site_code, mode):
+        pattern = re.compile(site_to_regex(site_code, mode))
+        return {target for target in self.ALPHABET if pattern.fullmatch(target)}
+
+    def test_table_covers_every_iupac_code(self):
+        assert set(self.DEFINITE_MATCHES) == set(self.ALPHABET)
+
+    def test_definite_matches_exactly_the_pinned_table(self):
+        for site_code, expected in self.DEFINITE_MATCHES.items():
+            assert self._matches(site_code, AMBIGUITY_DEFINITE) == set(expected), site_code
+
+    def test_definite_is_the_default(self):
+        # Callers that pass no mode get the original behaviour.
+        for site_code in self.ALPHABET:
+            assert re.compile(site_to_regex(site_code)).pattern ==                    re.compile(site_to_regex(site_code, AMBIGUITY_DEFINITE)).pattern
+
+    def test_the_anchor_cases_the_docs_promise(self):
+        # An enzyme N accepts a target N; an enzyme A does not.
+        assert 'N' in self._matches('N', AMBIGUITY_DEFINITE)
+        assert 'N' not in self._matches('A', AMBIGUITY_DEFINITE)
+        # Enzyme T does not definitely match a target Y, since Y may be C.
+        assert 'Y' not in self._matches('T', AMBIGUITY_DEFINITE)
+
+    def test_possible_is_strictly_looser_and_not_swapped(self):
+        """Guards against the two modes being transposed."""
+        strictly_looser = 0
+        for site_code in self.ALPHABET:
+            definite = self._matches(site_code, AMBIGUITY_DEFINITE)
+            possible = self._matches(site_code, AMBIGUITY_POSSIBLE)
+            assert definite <= possible, site_code
+            strictly_looser += definite < possible
+        assert strictly_looser, "possible mode never differed from definite"
+        # Enzyme T may match a target Y (Y can be T); enzyme A cannot (Y is C or T).
+        assert 'Y' in self._matches('T', AMBIGUITY_POSSIBLE)
+        assert 'Y' not in self._matches('A', AMBIGUITY_POSSIBLE)
+
+    def test_concrete_targets_are_unaffected_by_mode(self):
+        """On plain ACGT input the two modes cannot disagree."""
+        for site_code in self.ALPHABET:
+            definite = self._matches(site_code, AMBIGUITY_DEFINITE) & set('ACGT')
+            possible = self._matches(site_code, AMBIGUITY_POSSIBLE) & set('ACGT')
+            assert definite == possible, site_code
+
+
 class TestFindSites:
     def test_two_sites(self):
         seq = "GAATTCGAATTC"
